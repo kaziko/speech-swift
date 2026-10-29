@@ -128,10 +128,36 @@ public final class OmniVoiceTTSModel {
         duration: Double? = nil,
         numSteps: Int = 16
     ) throws -> [Float] {
+        try generate(
+            text: text, reference: encodeReference(referenceAudio), referenceText: referenceText,
+            language: language, instruct: instruct, duration: duration, numSteps: numSteps)
+    }
+
+    /// Encode a reference clip once, for many `generate(text:reference:...)` calls.
+    /// Loading, resampling and the codec encode then run once per clip instead of
+    /// once per sentence.
+    /// - Parameter referenceAudio: reference clip (any format/rate; resampled to 24 kHz).
+    public func encodeReference(_ referenceAudio: URL) throws -> OmniVoiceReference {
         let refSamples = try AudioFileLoader.load(
             url: referenceAudio, targetSampleRate: cfg.sampleRate)
         let refWav = MLXArray(refSamples).reshaped([1, 1, refSamples.count])
-        let refTokens = encoder.encode(refWav)
+        let tokens = encoder.encode(refWav)
+        MLX.eval(tokens)
+        return OmniVoiceReference(tokens: tokens)
+    }
+
+    /// Synthesize cloned speech from a reference encoded by `encodeReference(_:)`.
+    /// Same parameters and output as `generate(text:referenceAudio:...)`.
+    public func generate(
+        text: String,
+        reference: OmniVoiceReference,
+        referenceText: String?,
+        language: String = "en",
+        instruct: String? = nil,
+        duration: Double? = nil,
+        numSteps: Int = 16
+    ) throws -> [Float] {
+        let refTokens = reference.tokens
 
         // Target length: an explicit duration wins; otherwise estimate the token
         // count from the reference's pace (its text weight vs its token count),
@@ -218,4 +244,13 @@ public final class OmniVoiceTTSModel {
         else { return nil }
         return (g, b)
     }
+}
+
+/// The `[8, R]` codec tokens of a reference clip, from
+/// `OmniVoiceTTSModel.encodeReference(_:)`. Read-only after creation.
+public struct OmniVoiceReference: @unchecked Sendable {
+    let tokens: MLXArray
+
+    /// Number of reference audio tokens (25 per second of audio).
+    public var tokenCount: Int { tokens.dim(tokens.ndim - 1) }
 }
