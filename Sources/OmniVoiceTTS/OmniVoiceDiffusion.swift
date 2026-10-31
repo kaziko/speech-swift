@@ -15,10 +15,14 @@ extension OmniVoiceModel {
     /// - condInputIds: `[1, C, condLen]` — style+text+ref+target (target all-mask).
     /// - audioMask: `[1, condLen]` (0/1).
     /// - targetLen: number of audio frames to generate (the trailing positions).
+    /// - packed: run cond and uncond in one packed forward per step
+    ///   (`guidanceLogits`, the default) instead of two forwards. Same tokens up
+    ///   to float summation order, which can flip a rare top-k pick.
     public func generateTokens(
         condInputIds: MLXArray, audioMask: MLXArray, targetLen: Int,
         numSteps: Int = 16, guidance: Float = 2.0, tShift: Float = 0.1,
-        layerPenalty: Float = 5.0, onStep: ((Int, MLXArray) -> Void)? = nil
+        layerPenalty: Float = 5.0, packed: Bool = true,
+        onStep: ((Int, MLXArray) -> Void)? = nil
     ) -> MLXArray {
         let C = cfg.numAudioCodebook
         let maskId = cfg.audioMaskId
@@ -52,13 +56,20 @@ extension OmniVoiceModel {
             let k = schedule[step]
             if k <= 0 { continue }
 
-            let condLogits = self(inputIds: cond, audioMask: audioMask)[
-                0..., 0..., tStart ..< condLen, 0...]                       // [1, C, T, V]
-            let uncondLogits = self(inputIds: tokens, audioMask: uncondMask) // [1, C, T, V]
+            let condLogits: MLXArray, uncondLogits: MLXArray              // [1, C, T, V]
+            if packed {
+                (condLogits, uncondLogits) = guidanceLogits(
+                    condInputIds: cond, audioMask: audioMask, tokens: tokens)
+            } else {
+                condLogits = self(inputIds: cond, audioMask: audioMask)[
+                    0..., 0..., tStart ..< condLen, 0...]
+                uncondLogits = self(inputIds: tokens, audioMask: uncondMask)
+            }
 
-            // CFG in log-prob space, then re-normalise.
-            let cLog = logSoftmax(condLogits)
-            let uLog = logSoftmax(uncondLogits)
+            // CFG in log-prob space, then re-normalise. In fp32 whatever the
+            // backbone's dtype: fp16 log-probs would blur the top-k ranking.
+            let cLog = logSoftmax(condLogits.asType(.float32))
+            let uLog = logSoftmax(uncondLogits.asType(.float32))
             var logProbs = logSoftmax(cLog + guidance * (cLog - uLog))
             // Never emit the mask token.
             var maskCol = MLXArray.zeros([cfg.audioVocabSize])

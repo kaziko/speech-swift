@@ -47,17 +47,33 @@ final class OVAttention: Module {
         self.freqs = freqs
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    /// - segments: lengths of independent sequences packed along `L` (they sum
+    ///   to `L`). Each one attends only to itself, with RoPE positions from 0, so
+    ///   the result equals running each sequence alone. `nil` = one sequence.
+    func callAsFunction(_ x: MLXArray, segments: [Int]? = nil) -> MLXArray {
         let (b, l) = (x.dim(0), x.dim(1))
         // [B, L, H, D] → per-head RMSNorm → [B, H, L, D]
-        var q = qNorm(qProj(x).reshaped([b, l, nHeads, headDim])).transposed(0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped([b, l, nKVHeads, headDim])).transposed(0, 2, 1, 3)
-        var v = vProj(x).reshaped([b, l, nKVHeads, headDim]).transposed(0, 2, 1, 3)
-        q = freqs.rope(q)
-        k = freqs.rope(k)
+        let q = qNorm(qProj(x).reshaped([b, l, nHeads, headDim])).transposed(0, 2, 1, 3)
+        let k = kNorm(kProj(x).reshaped([b, l, nKVHeads, headDim])).transposed(0, 2, 1, 3)
+        let v = vProj(x).reshaped([b, l, nKVHeads, headDim]).transposed(0, 2, 1, 3)
         // Bidirectional: no mask. SDPA handles GQA (q heads > kv heads) directly.
-        let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v, scale: scale, mask: .none)
+        func attend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> MLXArray {
+            MLXFast.scaledDotProductAttention(
+                queries: freqs.rope(q), keys: freqs.rope(k), values: v, scale: scale, mask: .none)
+        }
+        let out: MLXArray
+        if let segments {
+            var parts = [MLXArray]()
+            var start = 0
+            for n in segments {
+                let r = start ..< start + n
+                parts.append(attend(q[0..., 0..., r, 0...], k[0..., 0..., r, 0...], v[0..., 0..., r, 0...]))
+                start += n
+            }
+            out = concatenated(parts, axis: 2)
+        } else {
+            out = attend(q, k, v)
+        }
         return oProj(out.transposed(0, 2, 1, 3).reshaped([b, l, nHeads * headDim]))
     }
 }
@@ -92,8 +108,8 @@ final class OVBlock: Module {
         _postAttentionLayerNorm.wrappedValue = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let h = x + selfAttn(inputLayerNorm(x))
+    func callAsFunction(_ x: MLXArray, segments: [Int]? = nil) -> MLXArray {
+        let h = x + selfAttn(inputLayerNorm(x), segments: segments)
         return h + mlp(postAttentionLayerNorm(h))
     }
 }
@@ -114,9 +130,10 @@ final class OVBackbone: Module {
     }
 
     /// `embeddings`: `[B, L, hidden]` → `[B, L, hidden]` (post final norm).
-    func callAsFunction(_ embeddings: MLXArray) -> MLXArray {
+    /// `segments`: see `OVAttention`; `nil` = one sequence.
+    func callAsFunction(_ embeddings: MLXArray, segments: [Int]? = nil) -> MLXArray {
         var h = embeddings
-        for layer in layers { h = layer(h) }
+        for layer in layers { h = layer(h, segments: segments) }
         return norm(h)
     }
 }
