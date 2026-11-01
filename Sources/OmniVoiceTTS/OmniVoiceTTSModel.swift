@@ -157,8 +157,6 @@ public final class OmniVoiceTTSModel {
         duration: Double? = nil,
         numSteps: Int = 16
     ) throws -> [Float] {
-        let refTokens = reference.tokens
-
         // Target length: an explicit duration wins; otherwise estimate the token
         // count from the reference's pace (its text weight vs its token count),
         // matching OmniVoice's `_estimate_target_tokens`.
@@ -166,14 +164,14 @@ public final class OmniVoiceTTSModel {
         if let d = duration {
             targetLen = max(1, Int((d * frameRate).rounded()))
         } else {
-            let refTokenCount = refTokens.dim(refTokens.ndim - 1)
             targetLen = RuleDurationEstimator.shared.estimateTargetTokens(
-                targetText: text, refText: referenceText, numRefAudioTokens: refTokenCount)
+                targetText: text, refText: referenceText,
+                numRefAudioTokens: reference.tokenCount)
         }
 
         let (ids, mask) = builder.buildInputs(
             text: text, refText: referenceText, lang: language,
-            refAudioTokens: refTokens, targetLen: targetLen, denoise: true, instruct: instruct)
+            refAudioTokens: reference.tokens, targetLen: targetLen, denoise: true, instruct: instruct)
         let tokens = model.generateTokens(
             condInputIds: ids, audioMask: mask, targetLen: targetLen, numSteps: numSteps)
         let wav = codec.decode(tokens)
@@ -246,7 +244,7 @@ public final class OmniVoiceTTSModel {
     }
 }
 
-/// The `[8, R]` codec tokens of a reference clip, from
+/// The `[1, 8, R]` codec tokens of a reference clip, from
 /// `OmniVoiceTTSModel.encodeReference(_:)`. Read-only after creation.
 public struct OmniVoiceReference: @unchecked Sendable {
     let tokens: MLXArray
